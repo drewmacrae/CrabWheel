@@ -38,13 +38,11 @@ class Wheel : Part {
     private float pivot;
     private float drive;
 
-    private bool moveRight    = false,//control inputs 
-		         moveLeft     = false, 
-		         moveForward  = false, 
-		         moveBackward = false,
-                 rotateRight  = false,
-                 rotateLeft   = false,
-		         brake        = false;
+    private float rotateRight = 0F;
+    private float moveRight = 0F;
+    private float moveForward = 0F;
+    private float brake = 0F;
+
 
     private bool created = false;
 
@@ -54,18 +52,26 @@ class Wheel : Part {
     //configurable variables//
     //----------------------//
     public float brakeForce = 1.5F;
+    public float driveStrength = 0.5F;
+    public float turnStrength = 0.02F;
+    
     public float suspensionSpring = 2.0F;
     public float suspensionDamper = 0.3F;
     public float suspensionDistance = 0.5F;
+
     public float wheelRadius = 0.3F;
     public float wheelMass = 0.1F;
-    public float driveStrength = 0.5F;
-    public float turnStrength = 0.02F;
+    
     public float steeringRateLimit = 45F;
     public float driveMotorTimeConstant = 1F;
     public float viscousFrictionCoefficient = 0.2F;
 
+    public float steeringRange = 90F;
+    public bool fullySteerable = true;
+    public bool radialStarting = true;
 
+    public float forwardFrictionValue = 0.5F;
+    public float sidewaysFrictionValue = 0.003F;
     
     // Find all the parts of interest and hide wheel centers on startup.
     protected override void onPartStart() {
@@ -78,6 +84,7 @@ class Wheel : Part {
         //downward the center will cast a ray downward to find how high it is 
         //off the ground. If it's rotated wrong it will allow the wheel 
         //colliders to fall into the terrain.
+
         pivot = 0;
         drive = 0;
         pivotGain = steeringRateLimit / 0.9F;
@@ -105,6 +112,15 @@ class Wheel : Part {
         wheel.suspensionDistance = suspensionDistance;
         wheel.mass = wheelMass;
 	    wheel.suspensionSpring = spring;
+
+        WheelFrictionCurve forwardFriction = wheel.forwardFriction;
+        WheelFrictionCurve sidewaysFriction = wheel.sidewaysFriction;
+
+        forwardFriction.stiffness = forwardFrictionValue;
+        sidewaysFriction.stiffness = sidewaysFrictionValue;
+
+        wheel.forwardFriction = forwardFriction;
+        wheel.sidewaysFriction = sidewaysFriction;
 
         wheelRotation = 0;
 
@@ -144,6 +160,9 @@ class Wheel : Part {
 
         if (!created)
             return;
+
+        if (!vessel.isActiveVessel || !vessel.isCommandable)
+            return;//don't want other things driving away...
         
         float velocity = rigidbody.velocity.magnitude;
 
@@ -151,9 +170,9 @@ class Wheel : Part {
         offCenter = offCenter-Vector3.Project(offCenter, vessel.transform.up);
 
         //where does the player want to go?
-        Vector3 driveComp = vessel.transform.right * (moveRight ? driveStrength : moveLeft ? -driveStrength : 0) +
-                            vessel.transform.forward * (moveForward ? driveStrength : moveBackward ? -driveStrength : 0);
-        float turnMag = (rotateRight ? turnStrength : rotateLeft ? -turnStrength : 0);
+        Vector3 driveComp = vessel.transform.right * moveRight * driveStrength +
+                            vessel.transform.forward * moveForward * driveStrength;
+        float turnMag = rotateRight * turnStrength ;
         
         //which way should the wheel drive to turn
         Vector3 turnDir = Vector3.Cross(vessel.transform.up,offCenter);
@@ -176,22 +195,25 @@ class Wheel : Part {
             
             float degreeError = angularError * 180F / Mathf.PI;
             pivot = pivot + angularError * pivotGain * TimeWarp.fixedDeltaTime;
+
+            if (pivot > steeringRange && !fullySteerable)
+                pivot = steeringRange;
+            else if (pivot < -steeringRange && !fullySteerable)
+                pivot = -steeringRange;
             
         }
-        float decay = driveMotorTimeConstant*TimeWarp.fixedDeltaTime;//FIXME add justification
-        drive = drive * (1 - decay) - decay * Vector3.Dot(total.normalized, suspension.transform.right);//
+        float decay = driveMotorTimeConstant*TimeWarp.fixedDeltaTime;
+        drive = drive * (1 - decay) + decay * Vector3.Dot(total.normalized, suspension.transform.right);
 
-        // Wheels friction. Proportional to speed to prevent car jerking on 
-        // stop, and constant at high speed.
         float friction = velocity * viscousFrictionCoefficient;
         if (friction < 0.001F)
             friction = 0; // it jerks otherwise.
 
 
-        float braking = brake ? brakeForce : friction;
+        float braking = (brake>0)? brake * brakeForce : friction;
 
         // Steering.
-        wheel.steerAngle = pivot;
+        wheel.steerAngle = radialStarting?pivot:pivot-90F;
 
         bool grounded = false;
 
@@ -201,14 +223,18 @@ class Wheel : Part {
         WheelHit wh;
         if (wheel.GetGroundHit(out wh))
         {
-            wh.point = center.InverseTransformPoint(wh.point);
-            offset = -(wheel.radius + wh.point.y);
-            grounded = true; 
-            if (offset> wheel.suspensionDistance)
-                //if it's in contact with the rest of the ship it will gradually drift 
-                offset = wheel.suspensionDistance;
-        }
+            wh.point = center.InverseTransformPoint(wh.point);//delay center by one frame to match collider
 
+            offset = -(wheel.radius + wh.point.y);
+            
+            grounded = true; 
+            //this keeps the wheel from floating away too far when rocket is zooming
+            if (offset> wheel.suspensionDistance)
+                offset = wheel.suspensionDistance;
+            else if (offset<0)
+                offset = 0;
+        }
+        
         if (grounded)
             wheel.motorTorque = drive / (velocity + 5F) * 5F;//over 5 m/s limit power not torque
         else
@@ -223,21 +249,18 @@ class Wheel : Part {
         // animate steering and wheel rotation.
 
         model.localEulerAngles = new Vector3(0,0,wheel.steerAngle);
-        suspension.localEulerAngles = new Vector3(0, 0, 90F+wheel.steerAngle);
+        suspension.localEulerAngles = new Vector3(0, 0, wheel.steerAngle-90F);
         model.Rotate(wheelRotation, 0, 0);
         wheelRotation += 6 * wheel.rpm *
                                TimeWarp.fixedDeltaTime;
         wheelRotation %= 360;
     }
-    // Process keyboard input. //FIXME so I can be linked to axes instead
+    // Process keyboard input. 
     protected override void onCtrlUpd( FlightCtrlState s ) {
-        rotateRight = Input.GetKey( KeyCode.E );
-        rotateLeft = Input.GetKey( KeyCode.Q );
-        moveRight= Input.GetKey( KeyCode.L );
-        moveLeft = Input.GetKey( KeyCode.J );
-        moveForward = Input.GetKey( KeyCode.I );
-        moveBackward = Input.GetKey( KeyCode.K );
-        brake = Input.GetKey( KeyCode.N );
+        rotateRight = s.roll;
+        moveRight = -s.X;
+        moveForward = -s.Y;
+        brake = (s.Z>0)?s.Z:0F;
 
         base.onCtrlUpd( s );
     }
