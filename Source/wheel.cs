@@ -38,13 +38,19 @@ class Wheel : Part {
     private float pivot;
     private float drive;
 
-    private float rotateRight = 0F;
+    private float rotateRoll = 0F;
+    private float rotateYaw = 0F;
+    private float rotatePitch = 0F;
+
     private float moveRight = 0F;
     private float moveForward = 0F;
+    private float moveUp = 0F;
+
     private float brake = 0F;
 
 
     private bool created = false;
+    private bool partActiveToggle = true;
 
     private float pivotGain;
 
@@ -72,6 +78,10 @@ class Wheel : Part {
 
     public float forwardFrictionValue = 0.5F;
     public float sidewaysFrictionValue = 0.003F;
+
+    public string activateWheelKey = ";";
+
+    private float offset;
     
     // Find all the parts of interest and hide wheel centers on startup.
     protected override void onPartStart() {
@@ -88,7 +98,10 @@ class Wheel : Part {
         pivot = 0;
         drive = 0;
         pivotGain = steeringRateLimit / 0.9F;
-        
+
+        this.stackIcon.SetIcon(DefaultIcons.LANDING_LEG);
+        this.stackIconGrouping = StackIconGrouping.SAME_MODULE;
+        this.stackIcon.SetIconColor(XKCDColors.Green);
         base.onPartStart();
     }
     
@@ -125,6 +138,8 @@ class Wheel : Part {
         wheelRotation = 0;
 
         created = true;
+
+        offset = 0;  
     }
 
     // Destroy physics.
@@ -145,6 +160,16 @@ class Wheel : Part {
         base.onPack();
     }
 
+    protected override void onPartUpdate()
+    {
+        if (Input.GetKeyDown(activateWheelKey))
+        {
+            partActiveToggle = !partActiveToggle;
+            print("toggling wheel activation to " + partActiveToggle.ToString());
+        }
+
+        this.stackIcon.SetIconColor(partActiveToggle ? XKCDColors.Green : XKCDColors.Orange);
+    }
     // Process controls and wheels animation.
     // Currently all the physics objects are created in this call, as soon 
     // as the part has created its rigidbody. Physics creation in OnPartStart 
@@ -153,6 +178,7 @@ class Wheel : Part {
     // it).
     protected override void onPartFixedUpdate()
     {
+
         if ((rigidbody != null) && (!rigidbody.isKinematic) && !created)
             createObjects();
 
@@ -163,83 +189,96 @@ class Wheel : Part {
 
         if (!vessel.isActiveVessel || !vessel.isCommandable)
             return;//don't want other things driving away...
+
         
         float velocity = rigidbody.velocity.magnitude;
 
-        Vector3 offCenter = vessel.findWorldCenterOfMass() - model.position;
-        offCenter = offCenter-Vector3.Project(offCenter, vessel.transform.up);
-
-        //where does the player want to go?
-        Vector3 driveComp = vessel.transform.right * moveRight * driveStrength +
-                            vessel.transform.forward * moveForward * driveStrength;
-        float turnMag = rotateRight * turnStrength ;
         
-        //which way should the wheel drive to turn
-        Vector3 turnDir = Vector3.Cross(vessel.transform.up,offCenter);
-        Vector3 turnComp = turnMag*offCenter.magnitude*turnDir.normalized;
-        
-        Vector3 total = driveComp+turnComp;
 
-        if (total.magnitude > 0.001F)//if we want to be driving anywhere
+        if (partActiveToggle)
         {
-            //solve for the nearest steering angle that is appropriate
-            Vector3 totalDir = total.normalized;
-            float tripProd=Vector3.Dot(vessel.transform.up,Vector3.Cross(suspension.transform.right,totalDir));
-            if (Mathf.Abs(tripProd)>1F)
+            Vector3 offCenter = vessel.findWorldCenterOfMass() - model.position;
+
+            //where does the player want to go?
+            Vector3 driveComp = vessel.transform.right * moveRight * driveStrength +
+                                vessel.transform.forward * moveForward * driveStrength +
+                                vessel.transform.up * moveUp * driveStrength;
+
+            Vector3 turnComp = vessel.transform.up * rotateRoll * turnStrength +
+                                vessel.transform.forward * rotateYaw * turnStrength +
+                                vessel.transform.right * rotatePitch * turnStrength;
+
+            //which way should the wheel drive to turn
+            turnComp = Vector3.Cross(offCenter, turnComp);
+
+            Vector3 total = driveComp + turnComp;
+
+            if (total.magnitude > 0.001F)//if we want to be driving anywhere
             {
-                print("assertion Failed, triple Product overran range");
-                tripProd = Mathf.Sign(tripProd);
+                //solve for the nearest steering angle that is appropriate
+                //project desired motion onto percieved ground plane(assume suspension is upright)
+                Vector3 totalProj = total - center.up * Vector3.Dot(total, center.up);
+
+                float tripProd = Vector3.Dot(center.up, Vector3.Cross(suspension.transform.right, totalProj.normalized));
+                if (Mathf.Abs(tripProd) > 1F)
+                {
+                    print("assertion Failed, triple Product overran range");
+                    tripProd = Mathf.Sign(tripProd);
+                }
+
+                float angularError = Mathf.Asin(tripProd) * Mathf.Sign(Vector3.Dot(suspension.transform.right, totalProj.normalized));
+
+                float degreeError = angularError * 180F / Mathf.PI;
+                pivot = pivot + angularError * pivotGain * TimeWarp.fixedDeltaTime;
+
+                if (pivot > steeringRange && !fullySteerable)
+                    pivot = steeringRange;
+                else if (pivot < -steeringRange && !fullySteerable)
+                    pivot = -steeringRange;
+
+            }
+            float decay = driveMotorTimeConstant * TimeWarp.fixedDeltaTime;
+            drive = drive * (1 - decay) + decay * Vector3.Dot(total.normalized, suspension.transform.right);
+
+            float friction = velocity * viscousFrictionCoefficient;
+            if (friction < 0.001F)
+                friction = 0; // it jerks otherwise.
+
+            brake = -Vector3.Dot(driveComp, center.up);
+            float braking = (brake > 0) ? brake * brakeForce : friction;
+
+            // Steering.
+            wheel.steerAngle = radialStarting ? pivot : pivot - 90F;
+
+            bool grounded = false;
+
+            // Determine whether the WheelCollider touches the ground,
+            // and at what distance from rigidbody's origin.
+            WheelHit wh;
+            if (wheel.GetGroundHit(out wh))
+            {
+                wh.point = center.InverseTransformPoint(wh.point);//delay center by one frame to match collider
+
+                offset = -(wheel.radius + wh.point.y);
+
+                grounded = true;
+                //this keeps the wheel from floating away too far when rocket is zooming
+                if (offset > wheel.suspensionDistance)
+                    offset = wheel.suspensionDistance;
+                else if (offset < 0)
+                    offset = 0;
             }
 
-            float angularError = Mathf.Asin(tripProd)*Mathf.Sign(Vector3.Dot(suspension.transform.right,totalDir));
-            
-            float degreeError = angularError * 180F / Mathf.PI;
-            pivot = pivot + angularError * pivotGain * TimeWarp.fixedDeltaTime;
-
-            if (pivot > steeringRange && !fullySteerable)
-                pivot = steeringRange;
-            else if (pivot < -steeringRange && !fullySteerable)
-                pivot = -steeringRange;
-            
+            if (grounded)
+                wheel.motorTorque = drive / (velocity + 5F) * 5F;//over 5 m/s limit power not torque
+            else
+                wheel.motorTorque = drive;
+            wheel.brakeTorque = braking;
         }
-        float decay = driveMotorTimeConstant*TimeWarp.fixedDeltaTime;
-        drive = drive * (1 - decay) + decay * Vector3.Dot(total.normalized, suspension.transform.right);
-
-        float friction = velocity * viscousFrictionCoefficient;
-        if (friction < 0.001F)
-            friction = 0; // it jerks otherwise.
-
-
-        float braking = (brake>0)? brake * brakeForce : friction;
-
-        // Steering.
-        wheel.steerAngle = radialStarting?pivot:pivot-90F;
-
-        bool grounded = false;
-
-        // Determine whether the WheelCollider touches the ground,
-        // and at what distance from rigidbody's origin.
-        float offset = wheel.suspensionDistance;
-        WheelHit wh;
-        if (wheel.GetGroundHit(out wh))
-        {
-            wh.point = center.InverseTransformPoint(wh.point);//delay center by one frame to match collider
-
-            offset = -(wheel.radius + wh.point.y);
-            
-            grounded = true; 
-            //this keeps the wheel from floating away too far when rocket is zooming
-            if (offset> wheel.suspensionDistance)
-                offset = wheel.suspensionDistance;
-            else if (offset<0)
-                offset = 0;
-        }
-        
-        if (grounded)
-            wheel.motorTorque = drive / (velocity + 5F) * 5F;//over 5 m/s limit power not torque
         else
-            wheel.motorTorque = drive;
-        wheel.brakeTorque = braking;
+        {
+            wheel.brakeTorque = 1;
+        }
 
         // now offset visible model and suspension lever. 
         Vector3 v = model.localPosition;
@@ -257,10 +296,13 @@ class Wheel : Part {
     }
     // Process keyboard input. 
     protected override void onCtrlUpd( FlightCtrlState s ) {
-        rotateRight = s.roll;
+        rotateRoll = -s.roll;
+        rotatePitch = -s.pitch;
+        rotateYaw = -s.yaw;
+
         moveRight = -s.X;
         moveForward = -s.Y;
-        brake = (s.Z>0)?s.Z:0F;
+        moveUp = -s.Z;
 
         base.onCtrlUpd( s );
     }
